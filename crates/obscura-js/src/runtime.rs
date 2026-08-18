@@ -22,7 +22,7 @@ impl<'a> IsoEnter<'a> {
 }
 impl<'a> Drop for IsoEnter<'a> {
     fn drop(&mut self) {
-        self.iso.exit();
+        unsafe { self.iso.exit() };
     }
 }
 use obscura_dom::{DomTree, NodeId};
@@ -448,7 +448,7 @@ let scope = &mut scope;
                 Some(ops)
             }
         };
-        isolate.exit();
+        unsafe { isolate.exit() };
         result
     }
 
