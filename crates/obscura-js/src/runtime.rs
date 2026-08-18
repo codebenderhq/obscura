@@ -296,10 +296,79 @@ impl ObscuraJsRuntime {
     /// through `proxy_url` (#139). `None` is equivalent to `with_base_url`
     /// (direct connection).
     pub fn with_base_url_and_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
-        let state = Rc::new(RefCell::new(ObscuraState::new()));
-        let state_clone = state.clone();
-        let import_map = state.borrow().import_map.clone();
+        let (state, import_map, module_loader, module_load_activity, loaded_module_specifiers) =
+            Self::build_state(base_url, proxy_url);
+        // Build the isolate under the process-wide creation lock so two
+        // connection threads never construct isolates concurrently (#430).
+        let runtime = {
+            let _create_guard = ISOLATE_CREATE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            JsRuntime::new(Self::runtime_options(module_loader.clone()))
+        };
+        Self::finish_build(
+            runtime,
+            state,
+            import_map,
+            module_load_activity,
+            loaded_module_specifiers,
+        )
+    }
 
+    /// The `deno_core::RuntimeOptions` obscura needs: the ops extension plus the
+    /// bootstrap `startup_snapshot`, wired to the given module loader. Hosts that
+    /// supply their own `JsRuntime` (see [`Self::new_with_runtime_factory`]) use
+    /// this so the injected runtime is byte-compatible with obscura's bootstrap.
+    pub fn runtime_options(module_loader: Rc<ObscuraModuleLoader>) -> RuntimeOptions {
+        RuntimeOptions {
+            extensions: vec![build_extension()],
+            module_loader: Some(module_loader),
+            startup_snapshot: Some(SNAPSHOT),
+            ..Default::default()
+        }
+    }
+
+    /// Construct an obscura runtime around a *host-provided* `JsRuntime`.
+    ///
+    /// This is the "inherit an existing V8" path: instead of spinning up its own
+    /// isolate, obscura wraps a runtime the host already created (and therefore
+    /// already initialized the V8 platform for, on a thread the host controls).
+    /// The `build` closure receives the module loader obscura constructed, so
+    /// the host can attach it to a runtime that reuses an existing
+    /// isolate/platform rather than creating a fresh one.
+    pub fn new_with_runtime_factory(
+        base_url: &str,
+        proxy_url: Option<String>,
+        build: impl FnOnce(Rc<ObscuraModuleLoader>) -> JsRuntime,
+    ) -> Self {
+        let (state, import_map, module_loader, module_load_activity, loaded_module_specifiers) =
+            Self::build_state(base_url, proxy_url);
+        // Serialize V8 construction even for host-supplied runtimes.
+        let _create_guard = ISOLATE_CREATE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = build(module_loader.clone());
+        Self::finish_build(
+            runtime,
+            state,
+            import_map,
+            module_load_activity,
+            loaded_module_specifiers,
+        )
+    }
+
+    fn build_state(
+        base_url: &str,
+        proxy_url: Option<String>,
+    ) -> (
+        Rc<RefCell<ObscuraState>>,
+        Rc<RefCell<ImportMap>>,
+        Rc<ObscuraModuleLoader>,
+        std::sync::Arc<ModuleLoadActivity>,
+        Rc<RefCell<Vec<String>>>,
+    ) {
+        let state = Rc::new(RefCell::new(ObscuraState::new()));
+        let import_map = state.borrow().import_map.clone();
         let module_loader = ObscuraModuleLoader::with_page_state(
             base_url,
             proxy_url,
@@ -309,47 +378,39 @@ impl ObscuraJsRuntime {
         let module_load_activity = module_loader.activity();
         let loaded_module_specifiers = module_loader.loaded_specifiers();
         let module_loader = Rc::new(module_loader);
+        (state, import_map, module_loader, module_load_activity, loaded_module_specifiers)
+    }
 
-        // Build the isolate under the process-wide creation lock so two
-        // connection threads never construct isolates concurrently (#430).
-        let (runtime, isolate_handle, heap_limit_state) = {
-            let _create_guard = ISOLATE_CREATE_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn finish_build(
+        mut runtime: JsRuntime,
+        state: Rc<RefCell<ObscuraState>>,
+        import_map: Rc<RefCell<ImportMap>>,
+        module_load_activity: std::sync::Arc<ModuleLoadActivity>,
+        loaded_module_specifiers: Rc<RefCell<Vec<String>>>,
+    ) -> Self {
+        {
+            let op_state = runtime.op_state();
+            let mut op_state = op_state.borrow_mut();
+            op_state.put(state.clone());
+            // Empty until a frame realm exists, which is what keeps the
+            // lookup free for pages that have no frames.
+            op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+        }
 
-            let mut runtime = JsRuntime::new(RuntimeOptions {
-                extensions: vec![build_extension()],
-                module_loader: Some(module_loader),
-                startup_snapshot: Some(SNAPSHOT),
-                ..Default::default()
-            });
+        let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+        let heap_limit_state = std::sync::Arc::new(HeapLimitState::default());
+        install_heap_limit_guard(
+            &mut runtime,
+            isolate_handle.clone(),
+            heap_limit_state.clone(),
+        );
 
-            {
-                let op_state = runtime.op_state();
-                let mut op_state = op_state.borrow_mut();
-                op_state.put(state_clone);
-                // Empty until a frame realm exists, which is what keeps the
-                // lookup free for pages that have no frames.
-                op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
-            }
-
-            let isolate_handle = runtime.v8_isolate().thread_safe_handle();
-            let heap_limit_state = std::sync::Arc::new(HeapLimitState::default());
-            install_heap_limit_guard(
-                &mut runtime,
-                isolate_handle.clone(),
-                heap_limit_state.clone(),
-            );
-
-            runtime
-                .execute_script(
-                    "<obscura:init>",
-                    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
-                )
-                .expect("init should not fail");
-
-            (runtime, isolate_handle, heap_limit_state)
-        };
+        runtime
+            .execute_script(
+                "<obscura:init>",
+                "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
+            )
+            .expect("init should not fail");
 
         let mut instance = ObscuraJsRuntime {
             runtime,
@@ -3230,6 +3291,22 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn build_from_external_runtime_runs_scripts() {
+        // Option 1: obscura inherits a host-provided JsRuntime (its own isolate
+        // is NOT spun up internally). The host builds the runtime with obscura's
+        // own options so the bootstrap snapshot/ops are present.
+        let mut rt = ObscuraJsRuntime::new_with_runtime_factory(
+            "about:blank",
+            None,
+            |loader| deno_core::JsRuntime::new(ObscuraJsRuntime::runtime_options(loader)),
+        );
+        assert_eq!(
+            rt.evaluate("(function(){ return 6 * 7; })()").unwrap(),
+            serde_json::json!(42.0)
+        );
     }
 
     #[test]
