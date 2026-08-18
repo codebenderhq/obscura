@@ -4,6 +4,27 @@ use std::rc::Rc;
 
 use deno_core::v8;
 use deno_core::{JsRuntime, RuntimeOptions};
+
+/// RAII guard that enters an isolate on construction and exits it on drop.
+///
+/// v8 150.x requires the isolate to be the *current* one (per-thread) for
+/// `ContextScope::new`, but obscura-js runs a page isolate across blocking
+/// threads (the director's isolate may be current on the pooled thread). Entering
+/// on the executing thread makes the scope operations valid.
+struct IsoEnter<'a> {
+    iso: &'a mut v8::Isolate,
+}
+impl<'a> IsoEnter<'a> {
+    fn new(iso: &'a mut v8::Isolate) -> Self {
+        iso.enter();
+        Self { iso }
+    }
+}
+impl<'a> Drop for IsoEnter<'a> {
+    fn drop(&mut self) {
+        self.iso.exit();
+    }
+}
 use obscura_dom::{DomTree, NodeId};
 
 /// Re-exported so other crates (obscura-browser, obscura-cdp) can name the V8
@@ -366,7 +387,8 @@ impl ObscuraJsRuntime {
     ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
         let context = {
             let isolate = &mut *self.runtime.v8_isolate();
-            let mut scope = v8::HandleScope::new(isolate);
+            let mut iso_guard = IsoEnter::new(isolate);
+            let mut scope = v8::HandleScope::new(&mut *iso_guard.iso);
 let mut scope = {
     let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
     scope_pinned.init()
@@ -400,28 +422,34 @@ let scope = &mut scope;
 
         let main = self.runtime.main_context();
         let isolate = &mut *self.runtime.v8_isolate();
-        let mut scope = v8::HandleScope::new(isolate);
-let mut scope = {
-    let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
-    scope_pinned.init()
-};
-let scope = &mut scope;
-        let context = v8::Local::new(scope, main);
-        let scope = &mut v8::ContextScope::new(scope, context);
+        isolate.enter();
+        let result = {
+            let mut scope = v8::HandleScope::new(isolate);
+            let mut scope = {
+                let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
+                scope_pinned.init()
+            };
+            let scope = &mut scope;
+            let context = v8::Local::new(scope, main);
+            let scope = &mut v8::ContextScope::new(scope, context);
 
-        let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
-        let ops_key = v8::String::new(scope, "ops")?;
-        let global = context.global(scope);
+            let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
+            let ops_key = v8::String::new(scope, "ops")?;
+            let global = context.global(scope);
 
-        let core = global.get(scope, handoff_key.into())?;
-        let core = core.to_object(scope)?;
-        let ops = core.get(scope, ops_key.into())?;
-        if !ops.is_object() {
-            return None;
-        }
-        let ops = v8::Global::new(scope, ops);
-        global.delete(scope, handoff_key.into());
-        Some(ops)
+            let core = global.get(scope, handoff_key.into())?;
+            let core = core.to_object(scope)?;
+            let ops = core.get(scope, ops_key.into())?;
+            if !ops.is_object() {
+                None
+            } else {
+                let ops = v8::Global::new(scope, ops);
+                global.delete(scope, handoff_key.into());
+                Some(ops)
+            }
+        };
+        isolate.exit();
+        result
     }
 
     /// Points a child realm's `Deno.core.ops` at the main realm's ops object.
@@ -440,7 +468,8 @@ let scope = &mut scope;
             return false;
         };
         let isolate = &mut *self.runtime.v8_isolate();
-        let mut scope = v8::HandleScope::new(isolate);
+        let mut iso_guard = IsoEnter::new(isolate);
+        let mut scope = v8::HandleScope::new(&mut *iso_guard.iso);
 let mut scope = {
     let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
     scope_pinned.init()
@@ -505,7 +534,8 @@ let scope = &mut scope;
         use deno_core::v8;
 
         let isolate = &mut *self.runtime.v8_isolate();
-        let mut scope = v8::HandleScope::new(isolate);
+        let mut iso_guard = IsoEnter::new(isolate);
+        let mut scope = v8::HandleScope::new(&mut *iso_guard.iso);
 let mut scope = {
     let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
     scope_pinned.init()
@@ -575,7 +605,8 @@ let scope = &mut tc;
 
         let main = self.runtime.main_context();
         let isolate = &mut *self.runtime.v8_isolate();
-        let mut scope = v8::HandleScope::new(isolate);
+        let mut iso_guard = IsoEnter::new(isolate);
+        let mut scope = v8::HandleScope::new(&mut *iso_guard.iso);
 let mut scope = {
     let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
     scope_pinned.init()
@@ -656,7 +687,8 @@ let scope = &mut scope;
 
         let main = self.runtime.main_context();
         let isolate = &mut *self.runtime.v8_isolate();
-        let mut scope = v8::HandleScope::new(isolate);
+        let mut iso_guard = IsoEnter::new(isolate);
+        let mut scope = v8::HandleScope::new(&mut *iso_guard.iso);
 let mut scope = {
     let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
     scope_pinned.init()
@@ -687,7 +719,8 @@ let scope = &mut scope;
 
         let main = self.runtime.main_context();
         let isolate = &mut *self.runtime.v8_isolate();
-        let mut scope = v8::HandleScope::new(isolate);
+        let mut iso_guard = IsoEnter::new(isolate);
+        let mut scope = v8::HandleScope::new(&mut *iso_guard.iso);
 let mut scope = {
     let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
     scope_pinned.init()
@@ -2180,7 +2213,8 @@ let scope = &mut scope;
         let result = (|| {
             let main = self.runtime.main_context();
             let isolate = &mut *self.runtime.v8_isolate();
-            let mut scope = v8::HandleScope::new(isolate);
+            let mut iso_guard = IsoEnter::new(isolate);
+            let mut scope = v8::HandleScope::new(&mut *iso_guard.iso);
             let mut scope = {
                 let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
                 scope_pinned.init()
@@ -3033,7 +3067,8 @@ let scope = &mut tc;
     ) -> Result<serde_json::Value, String> {
         let main = self.runtime.main_context();
         let isolate = &mut *self.runtime.v8_isolate();
-        let mut scope = v8::HandleScope::new(isolate);
+        let mut iso_guard = IsoEnter::new(isolate);
+        let mut scope = v8::HandleScope::new(&mut *iso_guard.iso);
         let mut scope = {
             let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
             scope_pinned.init()
