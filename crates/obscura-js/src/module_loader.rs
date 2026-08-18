@@ -4,12 +4,13 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use deno_core::error::ModuleLoaderError;
+use deno_core::ModuleLoadOptions;
+use deno_core::ModuleLoadReferrer;
 use deno_core::ModuleLoadResponse;
 use deno_core::ModuleLoader;
 use deno_core::ModuleSource;
 use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
-use deno_core::RequestedModuleType;
 
 use crate::import_map::ImportMap;
 use crate::ops::ObscuraState;
@@ -186,9 +187,8 @@ impl ModuleLoader for ObscuraModuleLoader {
     fn load(
         &self,
         module_specifier: &ModuleSpecifier,
-        maybe_referrer: Option<&ModuleSpecifier>,
-        is_dyn_import: bool,
-        _requested_module_type: RequestedModuleType,
+        maybe_referrer: Option<&ModuleLoadReferrer>,
+        options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
         // Module-graph CORS and same-origin credentials are relative to the
@@ -199,7 +199,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         let document_url = ModuleSpecifier::parse(&self.base_url)
             .unwrap_or_else(|_| module_specifier.clone());
         let referrer = maybe_referrer
-            .cloned()
+            .map(|r| r.specifier.clone())
             .unwrap_or_else(|| document_url.clone());
         // Capture the loader's proxy here so the async closure below owns a
         // plain Option<String> rather than borrowing &self across an `await`.
@@ -211,7 +211,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         // runtime between deno_core accepting the load and first polling it.
         // Keeping the guard inside the future makes cancellation/navigation
         // decrement the count through Drop as well as success and failure.
-        let activity_guard = is_dyn_import.then(|| activity.begin());
+        let activity_guard = options.is_dynamic_import.then(|| activity.begin());
         let page_network = match self.page_state.as_ref() {
             Some(weak) => (|| {
                 let state = weak
