@@ -16,7 +16,7 @@ struct IsoEnter<'a> {
 }
 impl<'a> IsoEnter<'a> {
     fn new(iso: &'a mut v8::Isolate) -> Self {
-        iso.enter();
+        unsafe { iso.enter() };
         Self { iso }
     }
 }
@@ -422,7 +422,7 @@ let scope = &mut scope;
 
         let main = self.runtime.main_context();
         let isolate = &mut *self.runtime.v8_isolate();
-        isolate.enter();
+        unsafe { isolate.enter() };
         let result = {
             let mut scope = v8::HandleScope::new(isolate);
             let mut scope = {
