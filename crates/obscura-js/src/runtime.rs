@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use deno_core::v8;
 use deno_core::{JsRuntime, RuntimeOptions};
 use obscura_dom::{DomTree, NodeId};
 
@@ -150,16 +151,6 @@ pub struct ObscuraJsRuntime {
     /// their shims can call ops; nothing else can reach it, including page
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
-}
-
-/// Renders a caught V8 exception as a message for realm evaluation errors.
-fn exception_text(
-    scope: &mut deno_core::v8::TryCatch<'_, deno_core::v8::HandleScope<'_>>,
-) -> String {
-    match scope.exception() {
-        Some(exception) => exception.to_rust_string_lossy(scope),
-        None => "unknown error".to_string(),
-    }
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -374,8 +365,13 @@ impl ObscuraJsRuntime {
         &mut self,
     ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
         let context = {
-            let isolate = self.runtime.v8_isolate();
-            let scope = &mut deno_core::v8::HandleScope::new(isolate);
+            let isolate = &mut *self.runtime.v8_isolate();
+            let mut scope = v8::HandleScope::new(isolate);
+let mut scope = {
+    let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
+    scope_pinned.init()
+};
+let scope = &mut scope;
             let context = deno_core::v8::Context::from_snapshot(
                 scope,
                 1,
@@ -403,8 +399,13 @@ impl ObscuraJsRuntime {
         use deno_core::v8;
 
         let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        let isolate = &mut *self.runtime.v8_isolate();
+        let mut scope = v8::HandleScope::new(isolate);
+let mut scope = {
+    let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
+    scope_pinned.init()
+};
+let scope = &mut scope;
         let context = v8::Local::new(scope, main);
         let scope = &mut v8::ContextScope::new(scope, context);
 
@@ -438,8 +439,13 @@ impl ObscuraJsRuntime {
         let Some(ops) = self.ops_handoff.clone() else {
             return false;
         };
-        let isolate = self.runtime.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        let isolate = &mut *self.runtime.v8_isolate();
+        let mut scope = v8::HandleScope::new(isolate);
+let mut scope = {
+    let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
+    scope_pinned.init()
+};
+let scope = &mut scope;
         let context = v8::Local::new(scope, realm);
         let scope = &mut v8::ContextScope::new(scope, context);
 
@@ -498,20 +504,49 @@ impl ObscuraJsRuntime {
     ) -> Result<String, String> {
         use deno_core::v8;
 
-        let isolate = self.runtime.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        let isolate = &mut *self.runtime.v8_isolate();
+        let mut scope = v8::HandleScope::new(isolate);
+let mut scope = {
+    let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
+    scope_pinned.init()
+};
+let scope = &mut scope;
         let context = v8::Local::new(scope, realm);
         let scope = &mut v8::ContextScope::new(scope, context);
-        let scope = &mut v8::TryCatch::new(scope);
+        let mut tc = v8::TryCatch::new(scope);
+let mut tc = {
+    let tc_pinned = unsafe { std::pin::Pin::new_unchecked(&mut tc) };
+    tc_pinned.init()
+};
+let scope = &mut tc;
 
         let code = v8::String::new(scope, source).ok_or("source too large")?;
         let script = match v8::Script::compile(scope, code, None) {
             Some(script) => script,
-            None => return Err(exception_text(scope)),
+            None => {
+                return Err(match scope.exception() {
+                    Some(exception) => format!(
+                        "JS error: {}",
+                        deno_core::error::JsError::from_v8_exception(scope, exception)
+                    ),
+                    None => {
+                        "JS error: script compilation failed without an exception"
+                            .to_string()
+                    }
+                })
+            }
         };
         match script.run(scope) {
             Some(value) => Ok(value.to_rust_string_lossy(scope)),
-            None => Err(exception_text(scope)),
+            None => Err(match scope.exception() {
+                Some(exception) => format!(
+                    "JS error: {}",
+                    deno_core::error::JsError::from_v8_exception(scope, exception)
+                ),
+                None => {
+                    "JS error: script execution failed without an exception".to_string()
+                }
+            }),
         }
     }
 
@@ -539,8 +574,13 @@ impl ObscuraJsRuntime {
         ];
 
         let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        let isolate = &mut *self.runtime.v8_isolate();
+        let mut scope = v8::HandleScope::new(isolate);
+let mut scope = {
+    let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
+    scope_pinned.init()
+};
+let scope = &mut scope;
 
         let main_context = v8::Local::new(scope, main);
         let mut carried = Vec::new();
@@ -615,8 +655,14 @@ impl ObscuraJsRuntime {
         use deno_core::v8;
 
         let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        let isolate = &mut *self.runtime.v8_isolate();
+        let mut scope = v8::HandleScope::new(isolate);
+let mut scope = {
+    let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
+    scope_pinned.init()
+};
+let scope = &mut scope;
+
         let main = v8::Local::new(scope, main);
         let realm = v8::Local::new(scope, realm);
         let token = main.get_security_token(scope);
@@ -640,8 +686,13 @@ impl ObscuraJsRuntime {
         use deno_core::v8;
 
         let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        let isolate = &mut *self.runtime.v8_isolate();
+        let mut scope = v8::HandleScope::new(isolate);
+let mut scope = {
+    let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
+    scope_pinned.init()
+};
+let scope = &mut scope;
 
         // Read the frame's globals first, then install them in the page realm.
         // Both contexts belong to this isolate, so the handles stay valid
@@ -2127,7 +2178,22 @@ impl ObscuraJsRuntime {
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
         let result = (|| {
-            let scope = &mut self.runtime.handle_scope();
+            let main = self.runtime.main_context();
+            let isolate = &mut *self.runtime.v8_isolate();
+            let mut scope = v8::HandleScope::new(isolate);
+            let mut scope = {
+                let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
+                scope_pinned.init()
+            };
+            let scope = &mut scope;
+            let context = v8::Local::new(scope, main);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let mut tc = v8::TryCatch::new(scope);
+let mut tc = {
+    let tc_pinned = unsafe { std::pin::Pin::new_unchecked(&mut tc) };
+    tc_pinned.init()
+};
+let scope = &mut tc;
             let source = deno_core::v8::String::new(scope, source)
                 .ok_or_else(|| "JS error: source allocation failed".to_string())?;
             let name = deno_core::v8::String::new(scope, name)
@@ -2145,7 +2211,6 @@ impl ObscuraJsRuntime {
                 false,
                 None,
             );
-            let scope = &mut deno_core::v8::TryCatch::new(scope);
             let script = deno_core::v8::Script::compile(scope, source, Some(&origin));
             let Some(script) = script else {
                 if scope.is_execution_terminating() {
@@ -2966,8 +3031,17 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
-        let scope = &mut self.runtime.handle_scope();
-        let local = deno_core::v8::Local::new(scope, result);
+        let main = self.runtime.main_context();
+        let isolate = &mut *self.runtime.v8_isolate();
+        let mut scope = v8::HandleScope::new(isolate);
+        let mut scope = {
+            let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut scope) };
+            scope_pinned.init()
+        };
+        let scope = &mut scope;
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let local = v8::Local::new(scope, result);
 
         if local.is_undefined() || local.is_null() {
             return Ok(serde_json::Value::Null);

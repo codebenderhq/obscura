@@ -147,7 +147,7 @@ impl ObscuraModuleLoader {
 }
 
 fn io_err(msg: String) -> ModuleLoaderError {
-    std::io::Error::new(std::io::ErrorKind::Other, msg).into()
+    deno_error::JsErrorBox::generic(msg)
 }
 
 impl ModuleLoader for ObscuraModuleLoader {
@@ -163,7 +163,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         // must not remap that root URL.
         if referrer == "." {
             return deno_core::resolve_import(specifier, &self.base_url)
-                .map_err(|error| error.into());
+                .map_err(deno_error::JsErrorBox::from_err);
         }
 
         let base = if referrer.is_empty()
