@@ -17,12 +17,12 @@ stealth = ["obscura-net/stealth"]
 render = ["dep:obscura-render", "obscura-render/paint"]
 
 [build-dependencies]
-deno_core = "=0.410.0"
+deno_core = "=0.402.0"
 
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
-deno_core = "=0.410.0"
+deno_core = "=0.402.0"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
