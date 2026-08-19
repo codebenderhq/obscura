@@ -25,6 +25,28 @@ impl<'a> Drop for IsoEnter<'a> {
         unsafe { self.iso.exit() };
     }
 }
+
+/// RAII guard that enters *this* `v8::Isolate` on the **current** thread and exits
+/// it on drop. Unlike `IsoEnter` it borrows the `JsRuntime` only for the `enter()`
+/// call (storing a raw pointer), so it can wrap a `deno_core` call that re-borrows
+/// the runtime. deno_core 0.410 builds a `ContextScope` in every scope-creating
+/// call (`execute_script`, `run_event_loop`, `poll_event_loop`, `mod_evaluate`,
+/// module loads) whose `new()` CHECKs that the isolate is the per-thread current
+/// one; deno_core never enters it for us. The obscura-js isolate may be created on
+/// a different thread than where it is later driven, so enter right before each
+/// deno_core call on the thread that actually runs it.
+struct EnterIsolate(std::ptr::NonNull<v8::Isolate>);
+impl EnterIsolate {
+    fn new(iso: &mut v8::Isolate) -> Self {
+        unsafe { iso.enter() };
+        EnterIsolate(std::ptr::NonNull::from(iso))
+    }
+}
+impl Drop for EnterIsolate {
+    fn drop(&mut self) {
+        unsafe { self.0.as_ref().exit() };
+    }
+}
 use obscura_dom::{DomTree, NodeId};
 
 /// Re-exported so other crates (obscura-browser, obscura-cdp) can name the V8
@@ -35,16 +57,14 @@ use crate::import_map::ImportMap;
 use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
-use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
 #[cfg(feature = "render")]
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
 };
+use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
 
 #[cfg(feature = "render")]
-struct RuntimeCanvasSurfaceSource<'a>(
-    &'a HashMap<NodeId, crate::ops::CanvasBackingSurface>,
-);
+struct RuntimeCanvasSurfaceSource<'a>(&'a HashMap<NodeId, crate::ops::CanvasBackingSurface>);
 
 #[cfg(feature = "render")]
 impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
@@ -114,13 +134,9 @@ fn with_sync_render_loading_disabled<R>(
     state: &mut ObscuraState,
     capture: impl FnOnce(&mut ObscuraState) -> R,
 ) -> R {
-    let previous = state
-        .render_resources
-        .set_sync_loading_enabled(false);
+    let previous = state.render_resources.set_sync_loading_enabled(false);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture(state)));
-    state
-        .render_resources
-        .set_sync_loading_enabled(previous);
+    state.render_resources.set_sync_loading_enabled(previous);
     match result {
         Ok(value) => value,
         Err(payload) => std::panic::resume_unwind(payload),
@@ -138,7 +154,10 @@ pub struct RemoteObjectInfo {
 }
 
 pub struct ObscuraJsRuntime {
-    runtime: JsRuntime,
+    // Wrapped in ManuallyDrop so the Drop impl can tear the inner JsRuntime down
+    // inside an explicit HandleScope (see `impl Drop` below). deno_core 0.410's
+    // realm teardown creates a V8 handle, which v8 150.4.0 requires a scope for.
+    runtime: std::mem::ManuallyDrop<JsRuntime>,
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
     object_counter: u64,
@@ -172,6 +191,25 @@ pub struct ObscuraJsRuntime {
     /// their shims can call ops; nothing else can reach it, including page
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+}
+
+impl Drop for ObscuraJsRuntime {
+    fn drop(&mut self) {
+        let _ = std::mem::replace(&mut self.ops_handoff, None);
+        // rusty_v8 "enters the isolate upon creation": the isolate stays on the
+        // per-thread V8 entry stack for its whole life. deno_core 0.410's
+        // JsRealmInner::destroy opens a HandleScope that allocates a V8 handle,
+        // which requires Isolate::GetCurrent() to be this isolate; the
+        // creation-enter satisfies that. OwnedIsolate::drop then exits the
+        // isolate, leaving it not-in-use for Dispose() (which aborts if
+        // IsInUse). The isolate must therefore be torn down on the same thread
+        // it was created on and no *other* isolate may be current on that thread
+        // (hosts run each obscura runtime on its own dedicated thread for this
+        // reason).
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.runtime);
+        }
+    }
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -369,16 +407,18 @@ impl ObscuraJsRuntime {
     ) {
         let state = Rc::new(RefCell::new(ObscuraState::new()));
         let import_map = state.borrow().import_map.clone();
-        let module_loader = ObscuraModuleLoader::with_page_state(
-            base_url,
-            proxy_url,
-            &state,
-            import_map.clone(),
-        );
+        let module_loader =
+            ObscuraModuleLoader::with_page_state(base_url, proxy_url, &state, import_map.clone());
         let module_load_activity = module_loader.activity();
         let loaded_module_specifiers = module_loader.loaded_specifiers();
         let module_loader = Rc::new(module_loader);
-        (state, import_map, module_loader, module_load_activity, loaded_module_specifiers)
+        (
+            state,
+            import_map,
+            module_loader,
+            module_load_activity,
+            loaded_module_specifiers,
+        )
     }
 
     fn finish_build(
@@ -413,7 +453,7 @@ impl ObscuraJsRuntime {
             .expect("init should not fail");
 
         let mut instance = ObscuraJsRuntime {
-            runtime,
+            runtime: std::mem::ManuallyDrop::new(runtime),
             state,
             object_store: HashMap::new(),
             object_counter: 0,
@@ -620,10 +660,7 @@ let scope = &mut tc;
                         "JS error: {}",
                         deno_core::error::JsError::from_v8_exception(scope, exception)
                     ),
-                    None => {
-                        "JS error: script compilation failed without an exception"
-                            .to_string()
-                    }
+                    None => "JS error: script compilation failed without an exception".to_string(),
                 })
             }
         };
@@ -634,9 +671,7 @@ let scope = &mut tc;
                     "JS error: {}",
                     deno_core::error::JsError::from_v8_exception(scope, exception)
                 ),
-                None => {
-                    "JS error: script execution failed without an exception".to_string()
-                }
+                None => "JS error: script execution failed without an exception".to_string(),
             }),
         }
     }
@@ -835,7 +870,9 @@ let scope = &mut scope;
             entry.set(scope, key.into(), document);
         }
         let index = v8::Integer::new_from_unsigned(scope, frame_id);
-        registry.set(scope, index.into(), entry.into()).unwrap_or(false)
+        registry
+            .set(scope, index.into(), entry.into())
+            .unwrap_or(false)
     }
 
     /// The table ops consult to find the calling realm's document.
@@ -880,10 +917,9 @@ let scope = &mut scope;
             .heap_limit_state
             .restore_limit
             .swap(0, std::sync::atomic::Ordering::SeqCst);
-        self.runtime
-            .remove_near_heap_limit_callback(restore_limit);
+        self.runtime.remove_near_heap_limit_callback(restore_limit);
         install_heap_limit_guard(
-            &mut self.runtime,
+            &mut *self.runtime,
             self.isolate_handle.clone(),
             self.heap_limit_state.clone(),
         );
@@ -904,11 +940,31 @@ let scope = &mut scope;
         name: &'static str,
         source: String,
     ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
+        // deno_core 0.410 never enters the isolate for us, but execute_script
+        // builds a ContextScope whose new() CHECKs the isolate is current.
+        unsafe { self.runtime.v8_isolate().enter() };
         let result = self
             .runtime
             .execute_script(name, source)
             .map_err(|error| error.to_string());
+        unsafe { self.runtime.v8_isolate().exit() };
         self.finish_heap_checked(result)
+    }
+
+    /// Run `perform_microtask_checkpoint` inside an entered HandleScope. deno_core
+    /// 0.410 does not open a scope for us; microtasks allocate V8 handles.
+    fn run_microtask_checkpoint_scoped(&mut self) {
+        unsafe { self.runtime.v8_isolate().enter() };
+        {
+            let mut hs = v8::HandleScope::new(self.runtime.v8_isolate());
+            let mut hs = {
+                let scope_pinned = unsafe { std::pin::Pin::new_unchecked(&mut hs) };
+                scope_pinned.init()
+            };
+            let _hs = &mut hs;
+            _hs.perform_microtask_checkpoint();
+        }
+        unsafe { self.runtime.v8_isolate().exit() };
     }
 
     /// Parse and merge an inline document import map. Rules which would alter
@@ -1125,18 +1181,11 @@ let scope = &mut scope;
     pub fn set_screen_size_override(&mut self, size: Option<(f64, f64)>, emulated: bool) {
         let script = match size {
             Some((width, height))
-                if width.is_finite()
-                    && height.is_finite()
-                    && width > 0.0
-                    && height > 0.0 =>
+                if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 =>
             {
-                format!(
-                    "globalThis.__obscura_set_screen_override({width},{height},{emulated});"
-                )
+                format!("globalThis.__obscura_set_screen_override({width},{height},{emulated});")
             }
-            _ => format!(
-                "globalThis.__obscura_set_screen_override(null,null,{emulated});"
-            ),
+            _ => format!("globalThis.__obscura_set_screen_override(null,null,{emulated});"),
         };
         let _ = self.execute_runtime_script("<set-screen-size>", script);
     }
@@ -1152,10 +1201,7 @@ let scope = &mut scope;
     /// Select the document-timeline instant used by the next render flush.
     /// Returns false for invalid times and preserves the current sample.
     #[cfg(feature = "render")]
-    pub fn set_animation_sample_time(
-        &self,
-        sample: obscura_render::AnimationSampleTime,
-    ) -> bool {
+    pub fn set_animation_sample_time(&self, sample: obscura_render::AnimationSampleTime) -> bool {
         self.set_animation_sample(obscura_render::AnimationSample::document(
             sample.milliseconds,
         ))
@@ -1168,8 +1214,8 @@ let scope = &mut scope;
         }
         let mut state = self.state.borrow_mut();
         if state.animation_sample != sample {
-            let forward_document_sample =
-                sample.mode == obscura_render::AnimationSampleMode::DocumentTime
+            let forward_document_sample = sample.mode
+                == obscura_render::AnimationSampleMode::DocumentTime
                 && state.animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime
                 && sample.time.milliseconds > state.animation_sample.time.milliseconds;
             if forward_document_sample
@@ -1255,11 +1301,7 @@ let scope = &mut scope;
         viewport: (f32, f32),
         base_url: Option<&str>,
     ) -> Option<Vec<u8>> {
-        self.screenshot_prepared_with_surface_color(
-            viewport,
-            base_url,
-            [255, 255, 255, 255],
-        )
+        self.screenshot_prepared_with_surface_color(viewport, base_url, [255, 255, 255, 255])
     }
 
     #[cfg(feature = "render")]
@@ -1475,9 +1517,7 @@ let scope = &mut scope;
                             .map(|value| value.trim().to_ascii_lowercase())
                             .as_deref()
                         {
-                            Some("use-credentials") => {
-                                crate::ops::ImageRequestProfile::CorsInclude
-                            }
+                            Some("use-credentials") => crate::ops::ImageRequestProfile::CorsInclude,
                             Some(_) => crate::ops::ImageRequestProfile::CorsSameOrigin,
                             None => crate::ops::ImageRequestProfile::NoCorsInclude,
                         };
@@ -2041,6 +2081,9 @@ let scope = &mut scope;
         // the first import edge.
         // The caller sizes the budget: short for enhancement modules on an
         // already-rendered page, full for an unmounted SPA shell (#205).
+        // deno_core 0.410 builds ContextScopes whose new() CHECKs the isolate is
+        // current; enter it on the thread that actually drives the load.
+        let _enter = EnterIsolate::new(self.runtime.v8_isolate());
         let module_id = match tokio::time::timeout(
             budget,
             self.runtime.load_side_es_module(&specifier),
@@ -2094,6 +2137,11 @@ let scope = &mut scope;
         }
 
         self.begin_javascript_task();
+        // deno_core 0.410 builds ContextScopes in mod_evaluate/run_event_loop
+        // whose new() CHECKs the isolate is current; keep it current for the span.
+        // Use a RAII guard so the isolate is exited even if this async fn is
+        // dropped (e.g. the timeout fires) mid-await.
+        let _enter = EnterIsolate::new(self.runtime.v8_isolate());
         let budget = tokio::time::Duration::from_millis(budget_ms);
         // deno_core 0.350 asserts instead of treating a second evaluation as
         // the module-map no-op required by browsers. The local outcome cache
@@ -2180,6 +2228,9 @@ let scope = &mut scope;
             .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
         let loaded_start = self.loaded_module_specifiers.borrow().len();
 
+        // deno_core 0.410 builds ContextScopes whose new() CHECKs the isolate is
+        // current; enter it on the thread that actually drives the load.
+        let _enter = EnterIsolate::new(self.runtime.v8_isolate());
         let module_id = match tokio::time::timeout(
             budget,
             self.runtime.load_side_es_module_from_code(
@@ -2414,18 +2465,22 @@ let scope = &mut tc;
 
     pub async fn run_event_loop(&mut self) -> Result<(), String> {
         self.begin_javascript_task();
+        // deno_core 0.410 never enters the isolate for us; run_event_loop builds
+        // a ContextScope whose new() CHECKs the isolate is current. RAII guard so
+        // the isolate is exited even if this async fn is dropped mid-await.
+        let _enter = EnterIsolate::new(self.runtime.v8_isolate());
         // A browser performs a microtask checkpoint at the end of each task.
         // deno_core's event loop may return immediately when no async op is
         // pending, leaving an already-resolved Promise continuation stranded
         // (document.fonts.load(...).then(...), framework post-render hooks,
         // and hydration follow-ups all rely on this boundary).
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        self.run_microtask_checkpoint_scoped();
         let result = self
             .runtime
             .run_event_loop(deno_core::PollEventLoopOptions::default())
             .await
             .map_err(|e| format!("Event loop error: {}", e));
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        self.run_microtask_checkpoint_scoped();
         self.finish_heap_checked(result)
     }
 
@@ -2544,11 +2599,11 @@ let scope = &mut tc;
         // per cooperative task. Adding the floor after the observation budget
         // guarantees that even a task beginning just before `deadline` gets
         // the same bounded completion allowance.
-        let synchronous_budget = budget
-            .saturating_add(std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS));
-        let token =
-            self.arm_watchdog(synchronous_budget
-                + std::time::Duration::from_millis(WATCHDOG_SCHEDULING_MARGIN_MS));
+        let synchronous_budget =
+            budget.saturating_add(std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS));
+        let token = self.arm_watchdog(
+            synchronous_budget + std::time::Duration::from_millis(WATCHDOG_SCHEDULING_MARGIN_MS),
+        );
         let result = loop {
             if tokio::time::Instant::now() >= deadline {
                 break Ok(());
@@ -2561,7 +2616,7 @@ let scope = &mut tc;
                     // queued from them belongs to a subsequent cooperative
                     // turn. Yield so the wall deadline remains observable even
                     // when every turn immediately schedules another one.
-                    self.runtime.v8_isolate().perform_microtask_checkpoint();
+                    self.run_microtask_checkpoint_scoped();
                     tokio::task::yield_now().await;
                 }
                 Ok(Err(error)) => break Err(error),
@@ -2606,7 +2661,10 @@ let scope = &mut tc;
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
         self.begin_javascript_task();
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        // deno_core 0.410 builds a ContextScope in poll_event_loop whose new()
+        // CHECKs the isolate is current; enter it on the thread that runs this.
+        let _enter = EnterIsolate::new(self.runtime.v8_isolate());
+        self.run_microtask_checkpoint_scoped();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
             let tick = self
@@ -2614,12 +2672,10 @@ let scope = &mut tc;
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
-                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
-                    "Event loop error: {error}"
-                ))),
-                std::task::Poll::Pending if waiting_for_wake => {
-                    std::task::Poll::Ready(Ok(false))
+                std::task::Poll::Ready(Err(error)) => {
+                    std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
                 }
+                std::task::Poll::Pending if waiting_for_wake => std::task::Poll::Ready(Ok(false)),
                 std::task::Poll::Pending => {
                     waiting_for_wake = true;
                     std::task::Poll::Pending
@@ -2652,7 +2708,7 @@ let scope = &mut tc;
             self.isolate_handle(),
             std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
         );
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        self.run_microtask_checkpoint_scoped();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
             self.cancel_termination();
             return Err("autonomous microtask checkpoint exceeded its task budget".into());
@@ -2662,6 +2718,9 @@ let scope = &mut tc;
         }
 
         let isolate_handle = self.isolate_handle();
+        // deno_core 0.410 builds a ContextScope in poll_event_loop whose new()
+        // CHECKs the isolate is current; enter it on the thread that runs this.
+        let _enter = EnterIsolate::new(self.runtime.v8_isolate());
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
             let watchdog = crate::cdp_watchdog::arm(
@@ -2680,12 +2739,10 @@ let scope = &mut tc;
             }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
-                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
-                    "Event loop error: {error}"
-                ))),
-                std::task::Poll::Pending if waiting_for_wake => {
-                    std::task::Poll::Ready(Ok(false))
+                std::task::Poll::Ready(Err(error)) => {
+                    std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
                 }
+                std::task::Poll::Pending if waiting_for_wake => std::task::Poll::Ready(Ok(false)),
                 std::task::Poll::Pending => {
                     waiting_for_wake = true;
                     std::task::Poll::Pending
@@ -2739,8 +2796,7 @@ let scope = &mut tc;
         let activity_tail = std::time::Duration::from_millis(OBSERVABLE_ACTIVITY_TAIL_MS);
         let mut activity_deadline = deadline.min(started + activity_tail);
         let token = self.arm_watchdog(
-            budget
-                .saturating_add(std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS))
+            budget.saturating_add(std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS))
                 + std::time::Duration::from_millis(WATCHDOG_SCHEDULING_MARGIN_MS),
         );
         let mut generation = self.activity_generation();
@@ -2844,7 +2900,14 @@ let scope = &mut tc;
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let token = self.arm_watchdog(timeout);
-        let result = self.runtime.execute_script("<eval>", wrapped);
+        // deno_core 0.410 builds a ContextScope in execute_script whose new()
+        // CHECKs the isolate is current; re-enter around the call.
+        let result = {
+            unsafe { self.runtime.v8_isolate().enter() };
+            let r = self.runtime.execute_script("<eval>", wrapped);
+            unsafe { self.runtime.v8_isolate().exit() };
+            r
+        };
         let fired = self.disarm_watchdog(token);
         if self.recover_heap_limit() {
             return Err("JavaScript heap limit exceeded; execution terminated".to_string());
@@ -2866,6 +2929,10 @@ let scope = &mut tc;
     pub async fn resolve_promises(&mut self) {
         self.begin_javascript_task();
         // Default settle: just pump until idle or 5s.
+        // deno_core 0.410 builds a ContextScope in run_event_loop whose new()
+        // CHECKs the isolate is current; re-enter around the pump. RAII guard so
+        // the isolate is exited even if this async fn is dropped mid-await.
+        let _enter = EnterIsolate::new(self.runtime.v8_isolate());
         let _ = tokio::time::timeout(
             tokio::time::Duration::from_secs(5),
             self.runtime
@@ -2887,11 +2954,7 @@ let scope = &mut tc;
     /// added ~7s per click because Puppeteer's `isIntersectingViewport`
     /// disconnects its observer in the callback, but our scheduled
     /// re-fires keep the event loop "busy" until they all fire.
-    pub async fn resolve_promises_until<F>(
-        &mut self,
-        mut done_check: F,
-        max_total_ms: u64,
-    ) -> bool
+    pub async fn resolve_promises_until<F>(&mut self, mut done_check: F, max_total_ms: u64) -> bool
     where
         F: FnMut(&mut Self) -> bool,
     {
@@ -2908,6 +2971,11 @@ let scope = &mut tc;
             }
             // Pump for a short slice. If the loop returns idle in <tick_ms,
             // run_event_loop returns Ok and we check the predicate again.
+            // deno_core 0.410 builds a ContextScope in run_event_loop whose new()
+            // CHECKs the isolate is current; re-enter around the pump. RAII guard
+            // so the isolate is exited even if this async fn is dropped mid-await
+            // (the timeout fires and the future is cancelled).
+            let _enter = EnterIsolate::new(self.runtime.v8_isolate());
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_millis(tick_ms),
                 self.runtime
@@ -3298,11 +3366,9 @@ mod tests {
         // Option 1: obscura inherits a host-provided JsRuntime (its own isolate
         // is NOT spun up internally). The host builds the runtime with obscura's
         // own options so the bootstrap snapshot/ops are present.
-        let mut rt = ObscuraJsRuntime::new_with_runtime_factory(
-            "about:blank",
-            None,
-            |loader| deno_core::JsRuntime::new(ObscuraJsRuntime::runtime_options(loader)),
-        );
+        let mut rt = ObscuraJsRuntime::new_with_runtime_factory("about:blank", None, |loader| {
+            deno_core::JsRuntime::new(ObscuraJsRuntime::runtime_options(loader))
+        });
         assert_eq!(
             rt.evaluate("(function(){ return 6 * 7; })()").unwrap(),
             serde_json::json!(42.0)
@@ -4242,7 +4308,9 @@ mod tests {
 
     #[test]
     fn clone_node_deep_copies_children_and_attributes() {
-        let mut rt = setup_runtime(r#"<html><body><ul id="l"><li class="a">one</li><li class="b">two</li></ul></body></html>"#);
+        let mut rt = setup_runtime(
+            r#"<html><body><ul id="l"><li class="a">one</li><li class="b">two</li></ul></body></html>"#,
+        );
         let out = rt
             .evaluate(
                 "(function(){var c=document.getElementById('l').cloneNode(true); return c.children.length + '|' + c.children[0].className + '|' + c.children[1].textContent;})()",
@@ -4268,7 +4336,9 @@ mod tests {
 
     #[test]
     fn clone_node_shallow_copies_attributes_without_children() {
-        let mut rt = setup_runtime(r#"<html><body><div id="d" data-x="7"><span>kid</span></div></body></html>"#);
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="d" data-x="7"><span>kid</span></div></body></html>"#,
+        );
         let out = rt
             .evaluate(
                 "(function(){var c=document.getElementById('d').cloneNode(false); return c.getAttribute('data-x') + '|' + c.childNodes.length;})()",
@@ -4285,7 +4355,10 @@ mod tests {
                 "(function(){var d=document.getElementById('d');d.style.color='red';d.style.fontSize='12px';var c=d.cloneNode(false);return c.style.color+'|'+c.style.fontSize+'|'+c.style.cssText;})()",
             )
             .unwrap();
-        assert_eq!(out, serde_json::json!("red|12px|color: red; font-size: 12px;"));
+        assert_eq!(
+            out,
+            serde_json::json!("red|12px|color: red; font-size: 12px;")
+        );
     }
 
     #[test]
@@ -4312,7 +4385,8 @@ mod tests {
 
     #[test]
     fn insert_adjacent_html_position_is_case_insensitive() {
-        let mut rt = setup_runtime(r#"<html><body><div id="host"><span>base</span></div></body></html>"#);
+        let mut rt =
+            setup_runtime(r#"<html><body><div id="host"><span>base</span></div></body></html>"#);
         let out = rt
             .evaluate("(function(){var h=document.getElementById('host'); h.insertAdjacentHTML('BeforeEnd','<b>x</b>'); return h.lastElementChild ? h.lastElementChild.tagName : 'NULL';})()")
             .unwrap();
@@ -4388,7 +4462,10 @@ mod tests {
         let v = rt
             .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g');return s.getAttribute('xlink:href')+'|'+s.getAttributeNames()[0]+'|'+s.outerHTML;})()")
             .unwrap();
-        assert_eq!(v, serde_json::json!("#g|xlink:href|<svg xlink:href=\"#g\"></svg>"));
+        assert_eq!(
+            v,
+            serde_json::json!("#g|xlink:href|<svg xlink:href=\"#g\"></svg>")
+        );
     }
 
     #[test]
@@ -4426,9 +4503,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             v,
-            serde_json::json!(
-                "NamespaceError|InvalidCharacterError|NamespaceError|NamespaceError"
-            )
+            serde_json::json!("NamespaceError|InvalidCharacterError|NamespaceError|NamespaceError")
         );
     }
 
@@ -5010,15 +5085,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!([
-                true,
-                "{\"ready\":true}",
-                true,
-                2,
-                true,
-                true,
-                "undefined"
-            ])
+            serde_json::json!([true, "{\"ready\":true}", true, 2, true, true, "undefined"])
         );
     }
 
@@ -5086,8 +5153,7 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([
-                true, true, true, true, true, true, true, true, true, true, true, true,
-                true
+                true, true, true, true, true, true, true, true, true, true, true, true, true
             ])
         );
     }
@@ -5802,9 +5868,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_event_loop_until_quiescent(2_000, 150)
-            .await
-            .unwrap();
+        rt.run_event_loop_until_quiescent(2_000, 150).await.unwrap();
         let elapsed = started.elapsed();
 
         assert!(
@@ -5830,17 +5894,12 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_event_loop_until_quiescent(2_000, 150)
-            .await
-            .unwrap();
+        rt.run_event_loop_until_quiescent(2_000, 150).await.unwrap();
         let elapsed = started.elapsed();
 
         assert!(
             elapsed >= std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS)
-                && elapsed
-                    < std::time::Duration::from_millis(
-                        SYNCHRONOUS_TASK_FLOOR_MS + 1_500,
-                    ),
+                && elapsed < std::time::Duration::from_millis(SYNCHRONOUS_TASK_FLOOR_MS + 1_500,),
             "one synchronous callback drain escaped the bounded task allowance: {elapsed:?}"
         );
         assert_eq!(
@@ -5923,8 +5982,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn quiescent_event_loop_allows_fetch_hydration_within_network_grace() {
-        let (mut rt, accepted) =
-            delayed_fetch_runtime(std::time::Duration::from_millis(700));
+        let (mut rt, accepted) = delayed_fetch_runtime(std::time::Duration::from_millis(700));
         rt.execute_script(
             "quiescent-fetch-hydration",
             "fetch('/hydrate').then(response => response.text()).then(text => {\
@@ -5934,9 +5992,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_event_loop_until_quiescent(3_000, 150)
-            .await
-            .unwrap();
+        rt.run_event_loop_until_quiescent(3_000, 150).await.unwrap();
         let elapsed = started.elapsed();
 
         accepted
@@ -5967,9 +6023,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_event_loop_until_quiescent(4_000, 150)
-            .await
-            .unwrap();
+        rt.run_event_loop_until_quiescent(4_000, 150).await.unwrap();
         let elapsed = started.elapsed();
 
         accepted
@@ -6000,9 +6054,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_event_loop_until_quiescent(4_000, 150)
-            .await
-            .unwrap();
+        rt.run_event_loop_until_quiescent(4_000, 150).await.unwrap();
         let elapsed = started.elapsed();
 
         assert_eq!(
@@ -8268,10 +8320,12 @@ mod tests {
             Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"/>"#.to_vec()),
         );
         let state = rt.state.borrow();
-        let prepared = state.prepared_render.as_ref().expect("retained style graph");
+        let prepared = state
+            .prepared_render
+            .as_ref()
+            .expect("retained style graph");
         assert_eq!(
-            prepared as *const obscura_render::PreparedRender as usize,
-            prepared_address,
+            prepared as *const obscura_render::PreparedRender as usize, prepared_address,
             "resource arrival waits for the next geometry flush"
         );
         assert_eq!(
@@ -8311,8 +8365,8 @@ mod tests {
             state
                 .prepared_render
                 .as_ref()
-                .expect("initial prepared render") as *const obscura_render::PreparedRender
-                as usize
+                .expect("initial prepared render")
+                as *const obscura_render::PreparedRender as usize
         };
 
         // Preserve already queued framework damage and coalesce repeated
@@ -8839,23 +8893,52 @@ mod tests {
                 __animation.currentTime = 50;
             "#,
         ).unwrap();
-        assert_eq!(rt.evaluate("box.style.opacity").unwrap(), serde_json::json!(".2"));
-        assert_eq!(rt.evaluate("box.getAnimations()[0] === __animation").unwrap(), serde_json::json!(true));
-        assert_eq!(rt.evaluate("document.getAnimations()[0] === __animation").unwrap(), serde_json::json!(true));
-        assert_eq!(rt.evaluate("__animation.playState").unwrap(), serde_json::json!("paused"));
+        assert_eq!(
+            rt.evaluate("box.style.opacity").unwrap(),
+            serde_json::json!(".2")
+        );
+        assert_eq!(
+            rt.evaluate("box.getAnimations()[0] === __animation")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            rt.evaluate("document.getAnimations()[0] === __animation")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            rt.evaluate("__animation.playState").unwrap(),
+            serde_json::json!("paused")
+        );
         assert_eq!(
             rt.evaluate("!('easingBezier' in __animation.effect.getTiming()) && !('linearEasing' in __animation.effect.getComputedTiming())").unwrap(),
             serde_json::json!(true),
         );
         let opacity = rt.evaluate("getComputedStyle(box).opacity").unwrap();
         let opacity = opacity.as_str().unwrap().parse::<f32>().unwrap();
-        assert!((opacity - 0.6).abs() < 0.001, "midpoint opacity was {opacity}");
+        assert!(
+            (opacity - 0.6).abs() < 0.001,
+            "midpoint opacity was {opacity}"
+        );
 
         rt.execute_script("cancel", "__animation.cancel()").unwrap();
-        assert_eq!(rt.evaluate("box.style.opacity").unwrap(), serde_json::json!(".2"));
-        assert_eq!(rt.evaluate("getComputedStyle(box).opacity").unwrap(), serde_json::json!("0.2"));
-        assert_eq!(rt.evaluate("box.getAnimations().length").unwrap(), serde_json::json!(0.0));
-        assert_eq!(rt.evaluate("document.getAnimations().length").unwrap(), serde_json::json!(0.0));
+        assert_eq!(
+            rt.evaluate("box.style.opacity").unwrap(),
+            serde_json::json!(".2")
+        );
+        assert_eq!(
+            rt.evaluate("getComputedStyle(box).opacity").unwrap(),
+            serde_json::json!("0.2")
+        );
+        assert_eq!(
+            rt.evaluate("box.getAnimations().length").unwrap(),
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            rt.evaluate("document.getAnimations().length").unwrap(),
+            serde_json::json!(0.0)
+        );
     }
 
     #[cfg(feature = "render")]
@@ -8878,9 +8961,18 @@ mod tests {
         rt.run_event_loop_bounded(20).await.unwrap();
         assert_eq!(rt.evaluate("__ready").unwrap(), serde_json::json!(true));
         assert_eq!(rt.evaluate("__finished").unwrap(), serde_json::json!(true));
-        assert_eq!(rt.evaluate("__finishEvent").unwrap(), serde_json::json!(true));
-        assert_eq!(rt.evaluate("__animation.playState").unwrap(), serde_json::json!("finished"));
-        assert_eq!(rt.evaluate("getComputedStyle(box).opacity").unwrap(), serde_json::json!("1"));
+        assert_eq!(
+            rt.evaluate("__finishEvent").unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            rt.evaluate("__animation.playState").unwrap(),
+            serde_json::json!("finished")
+        );
+        assert_eq!(
+            rt.evaluate("getComputedStyle(box).opacity").unwrap(),
+            serde_json::json!("1")
+        );
     }
 
     #[cfg(feature = "render")]
@@ -9033,9 +9125,7 @@ mod tests {
             );
             assert_eq!(
                 state.pending_style_mutations,
-                vec![obscura_render::RetainedStyleMutation::WaapiAnimation {
-                    node: box_node
-                }]
+                vec![obscura_render::RetainedStyleMutation::WaapiAnimation { node: box_node }]
             );
         }
         let initial = rt
@@ -9087,7 +9177,10 @@ mod tests {
             .unwrap()
             .as_f64()
             .unwrap();
-        assert!(animated_opacity > 0.9, "animated opacity={animated_opacity}");
+        assert!(
+            animated_opacity > 0.9,
+            "animated opacity={animated_opacity}"
+        );
 
         rt.evaluate("__cancelAnimation.cancel()").unwrap();
         assert!(
@@ -9364,7 +9457,10 @@ mod tests {
         let direct_rt = make_runtime();
         assert!(direct_rt.set_animation_sample(fixed));
         let direct = direct_rt
-            .screenshot_prepared((160.0, 100.0), Some("http://example.test/github-like-shell"))
+            .screenshot_prepared(
+                (160.0, 100.0),
+                Some("http://example.test/github-like-shell"),
+            )
             .expect("direct fixed-time capture");
 
         let mut geometry_rt = make_runtime();
@@ -9374,7 +9470,10 @@ mod tests {
         assert_eq!(rect["width"].as_f64(), Some(120.0));
         assert!(geometry_rt.set_animation_sample(fixed));
         let after_geometry = geometry_rt
-            .screenshot_prepared((160.0, 100.0), Some("http://example.test/github-like-shell"))
+            .screenshot_prepared(
+                (160.0, 100.0),
+                Some("http://example.test/github-like-shell"),
+            )
             .expect("fixed-time capture after geometry");
 
         assert_eq!(
@@ -10230,7 +10329,8 @@ mod tests {
             .unwrap();
         rt.run_event_loop_bounded(40).await.unwrap();
         assert_eq!(
-            rt.evaluate("[__resizeCallbacks, __resizeLoopErrors]").unwrap(),
+            rt.evaluate("[__resizeCallbacks, __resizeLoopErrors]")
+                .unwrap(),
             serde_json::json!([2, 2])
         );
     }
@@ -10416,11 +10516,7 @@ mod tests {
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(
             rt.evaluate("__intersectionDeliveryOrder").unwrap(),
-            serde_json::json!([
-                "first-observer",
-                "second-observer",
-                "callback-posted-task",
-            ])
+            serde_json::json!(["first-observer", "second-observer", "callback-posted-task",])
         );
     }
 
@@ -10545,10 +10641,7 @@ mod tests {
         // clips it. Programmatic scrolling then reveals the complete box.
         assert_eq!(
             result.value.unwrap(),
-            serde_json::json!([
-                [false, 0, [0, 0, 0, 0]],
-                [true, 1, [10, 100, 100, 20]],
-            ])
+            serde_json::json!([[false, 0, [0, 0, 0, 0]], [true, 1, [10, 100, 100, 20]],])
         );
     }
 
@@ -11420,8 +11513,16 @@ mod tests {
             result,
             serde_json::json!([
                 [true, 0, true, true, 1, 2],
-                ["\"a;b\"", "url(\"data:image/svg+xml;utf8,<svg/>\")"], true,
-                73, 91, "91px", 11, 64, 2, "#box", true
+                ["\"a;b\"", "url(\"data:image/svg+xml;utf8,<svg/>\")"],
+                true,
+                73,
+                91,
+                "91px",
+                11,
+                64,
+                2,
+                "#box",
+                true
             ])
         );
     }
@@ -11461,8 +11562,15 @@ mod tests {
         assert_eq!(
             result,
             serde_json::json!([
-                1, 1, true,
-                ["\"a;b\"", "url(\"data:image/svg+xml;utf8,<svg/>\")", true, true],
+                1,
+                1,
+                true,
+                [
+                    "\"a;b\"",
+                    "url(\"data:image/svg+xml;utf8,<svg/>\")",
+                    true,
+                    true
+                ],
                 ""
             ])
         );
@@ -11790,7 +11898,10 @@ mod tests {
             green_half.alpha()
         );
         let clipped = pixmap.pixel(23, 8).expect("outside overflow clip");
-        assert_eq!((clipped.red(), clipped.green(), clipped.blue()), (0, 0, 255));
+        assert_eq!(
+            (clipped.red(), clipped.green(), clipped.blue()),
+            (0, 0, 255)
+        );
         let blank = pixmap.pixel(34, 8).expect("transparent blank canvas");
         assert_eq!((blank.red(), blank.green(), blank.blue()), (0, 0, 255));
         let overlay = pixmap.pixel(11, 8).expect("higher z-index overlay");
@@ -11805,12 +11916,9 @@ mod tests {
         );
         let padded_content = pixmap.pixel(36, 23).expect("padded canvas content pixel");
         assert!(
-            padded_content.red() > 220
-                && padded_content.green() < 40
-                && padded_content.blue() < 40,
+            padded_content.red() > 220 && padded_content.green() < 40 && padded_content.blue() < 40,
             "canvas bitmap must start at the CSS content-box origin"
         );
-
     }
 
     #[test]
@@ -12323,7 +12431,9 @@ mod tests {
 
         let base = format!("http://{address}");
         let mut rt = ObscuraJsRuntime::new();
-        rt.set_dom(parse_html(&format!(r#"<img id="image" src="{base}/plain.png">"#)));
+        rt.set_dom(parse_html(&format!(
+            r#"<img id="image" src="{base}/plain.png">"#
+        )));
         // Deliberately make the image cross-origin from the document.
         rt.set_url("http://127.0.0.1:1/page.html");
         rt.set_http_client(std::sync::Arc::new(
@@ -12696,20 +12806,16 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader_calls = calls.clone();
         let png = two_by_three_png();
-        let mut rt = parser_image_runtime(
-            r#"<img id="late" src="late.png">"#,
-            move |_url: &str| {
+        let mut rt =
+            parser_image_runtime(r#"<img id="late" src="late.png">"#, move |_url: &str| {
                 loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Some(png.clone())
-            },
-        );
+            });
         {
             let mut state = rt.state.borrow_mut();
             let previous = state.render_resources.set_sync_loading_enabled(false);
             assert!(ensure_prepared_render(&mut state).is_some());
-            state
-                .render_resources
-                .set_sync_loading_enabled(previous);
+            state.render_resources.set_sync_loading_enabled(previous);
             assert!(state.prepared_render.is_some());
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -12770,9 +12876,7 @@ mod tests {
             let mut state = missing.state.borrow_mut();
             let previous = state.render_resources.set_sync_loading_enabled(false);
             assert!(ensure_prepared_render(&mut state).is_some());
-            state
-                .render_resources
-                .set_sync_loading_enabled(previous);
+            state.render_resources.set_sync_loading_enabled(previous);
             assert!(state.prepared_render.is_some());
         }
         missing
@@ -12794,10 +12898,7 @@ mod tests {
                 .unwrap(),
             serde_json::json!([true, 0, 0, ["error"]])
         );
-        assert_eq!(
-            missing_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(missing_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(missing.state.borrow().prepared_render.is_some());
     }
 
@@ -14966,9 +15067,7 @@ mod tests {
                     .and_then(|line| line.split_ascii_whitespace().nth(1))
                     .unwrap_or("/");
                 let body = match path {
-                    "/entry.js" => {
-                        "import './shared.js'; globalThis.__module_entry_ran = true;"
-                    }
+                    "/entry.js" => "import './shared.js'; globalThis.__module_entry_ran = true;",
                     "/shared.js" => {
                         "globalThis.__shared_module_runs = \
                          (globalThis.__shared_module_runs || 0) + 1;"
@@ -15187,7 +15286,8 @@ mod tests {
         rt.evaluate_prepared_module(shared, 1_000).await.unwrap();
 
         assert_eq!(
-            rt.evaluate("globalThis.__module_entry_ran === true").unwrap(),
+            rt.evaluate("globalThis.__module_entry_ran === true")
+                .unwrap(),
             serde_json::json!(true),
         );
         assert_eq!(
@@ -15213,7 +15313,8 @@ mod tests {
                 "unexpected heap failure: {error}",
             );
             assert_eq!(
-                rt.evaluate("globalThis.__runtime_survived_oom = true").unwrap(),
+                rt.evaluate("globalThis.__runtime_survived_oom = true")
+                    .unwrap(),
                 serde_json::json!(true),
             );
         }
@@ -15359,7 +15460,10 @@ mod tests {
             .collect::<Vec<_>>();
         for request in &requests {
             let lower = request.to_ascii_lowercase();
-            assert!(lower.contains("\r\norigin: http://127.0.0.1:1\r\n"), "{request}");
+            assert!(
+                lower.contains("\r\norigin: http://127.0.0.1:1\r\n"),
+                "{request}"
+            );
             assert!(!lower.contains("\r\ncookie:"), "{request}");
         }
         let child = requests

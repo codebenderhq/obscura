@@ -1,8 +1,11 @@
+use std::rc::Rc;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use deno_core::JsRuntime;
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
+use obscura_js::module_loader::ObscuraModuleLoader;
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -224,6 +227,7 @@ pub struct Page {
     /// declaration order, so the frames must go first.
     pub frames: Vec<FrameRealm>,
     pub js: Option<ObscuraJsRuntime>,
+    runtime_factory: Option<RuntimeFactory>,
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
@@ -293,6 +297,8 @@ pub struct Page {
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
+
+pub type RuntimeFactory = Arc<dyn Fn(Rc<ObscuraModuleLoader>) -> JsRuntime>;
 
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
@@ -877,6 +883,14 @@ fn inline_stylesheet_import_requests(dom: &DomTree) -> Vec<(usize, StylesheetImp
 
 impl Page {
     pub fn new(id: String, context: Arc<BrowserContext>) -> Self {
+        Self::new_with_runtime_factory(id, context, None)
+    }
+
+    pub fn new_with_runtime_factory(
+        id: String,
+        context: Arc<BrowserContext>,
+        runtime_factory: Option<RuntimeFactory>,
+    ) -> Self {
         let http_client = context.http_client.clone();
         // Chromium convention: the main frame's frameId == the targetId.
         // Playwright's frame manager looks up the main frame by targetId
@@ -907,6 +921,7 @@ impl Page {
             dom: None,
             frames: Vec::new(),
             js: None,
+            runtime_factory,
             lifecycle: LifecycleState::Idle,
             http_client,
             context,
@@ -1002,7 +1017,13 @@ impl Page {
                 continue;
             }
             let realm = match self.js.as_mut().and_then(|js| {
-                FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
+                FrameRealm::new(
+                    js,
+                    frame.frame_id,
+                    frame.parent_frame_id,
+                    &frame.url,
+                    &frame.html,
+                )
             }) {
                 Some(realm) => realm,
                 None => {
@@ -1022,7 +1043,9 @@ impl Page {
             let mut sources: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             for url in wanted {
-                let Ok(parsed) = Url::parse(&url) else { continue };
+                let Ok(parsed) = Url::parse(&url) else {
+                    continue;
+                };
                 if self.should_block_url(&url) {
                     continue;
                 }
@@ -1102,7 +1125,10 @@ impl Page {
                 .position(|frame| frame.frame_id() == message.target_frame_id)
             else {
                 // The frame was torn down between the send and the drain.
-                tracing::debug!("message for frame {} which is gone", message.target_frame_id);
+                tracing::debug!(
+                    "message for frame {} which is gone",
+                    message.target_frame_id
+                );
                 continue;
             };
             let Some(js) = self.js.as_mut() else { continue };
@@ -1112,7 +1138,10 @@ impl Page {
                 &message.origin,
                 message.source_frame_id,
             ) {
-                tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
+                tracing::debug!(
+                    "message to frame {} failed: {error}",
+                    message.target_frame_id
+                );
             }
         }
         true
@@ -1135,9 +1164,7 @@ impl Page {
         );
         self.execute_frame_owner_script(parent_frame_id, &script);
         if parent_frame_id != 0 {
-            let page_script = format!(
-                "delete globalThis.__obscura_frameObjects[{frame_id}];"
-            );
+            let page_script = format!("delete globalThis.__obscura_frameObjects[{frame_id}];");
             if let Some(js) = self.js.as_mut() {
                 if let Err(error) = js.execute_script("<frame-detach>", &page_script) {
                     tracing::debug!("releasing page frame reference failed: {error}");
@@ -1556,7 +1583,11 @@ impl Page {
                 tracing::info!("Blocked stylesheet by interception: {}", resolved);
                 continue;
             }
-            roots.push((AuthorStylesheetTarget::Linked(link_index), key.clone(), None));
+            roots.push((
+                AuthorStylesheetTarget::Linked(link_index),
+                key.clone(),
+                None,
+            ));
             if scheduled.insert(key.clone()) {
                 if scheduled.len() <= MAX_STYLESHEET_RESOURCES {
                     pending.push((key, resolved, 0u8));
@@ -1751,12 +1782,7 @@ impl Page {
                 return false;
             }
             let poll_budget = remaining.min(tokio::time::Duration::from_millis(25));
-            match tokio::time::timeout(
-                poll_budget,
-                js.run_load_delaying_event_loop_tick(),
-            )
-            .await
-            {
+            match tokio::time::timeout(poll_budget, js.run_load_delaying_event_loop_tick()).await {
                 Ok(Ok(_idle)) => {
                     if js.has_pending_load_delaying_scripts() {
                         tokio::task::yield_now().await;
@@ -2637,11 +2663,8 @@ impl Page {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(1_000);
-            let remaining_ms = remaining_settle_resource_warmup_ms(
-                max_ms,
-                settle_started.elapsed(),
-                warmup_ms,
-            );
+            let remaining_ms =
+                remaining_settle_resource_warmup_ms(max_ms, settle_started.elapsed(), warmup_ms);
             if remaining_ms != 0 {
                 let _ = self.prepare_screenshot_resources(remaining_ms).await;
             }
@@ -3321,9 +3344,7 @@ impl Page {
                     };
                     if let Some(js) = &mut self.js {
                         match profile {
-                            Some(profile) => {
-                                js.seed_render_image_resource(raw, profile, outcome)
-                            }
+                            Some(profile) => js.seed_render_image_resource(raw, profile, outcome),
                             None => js.seed_render_resource(raw, outcome),
                         }
                     }
@@ -4139,14 +4160,14 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "render")]
+    use super::remaining_settle_resource_warmup_ms;
     use super::{
         css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
         materialize_stylesheet_graph, navigation_referrer, navigation_timeout_from_env_value,
         parse_import_url, rebase_css_urls, script_response_is_executable, split_css_imports,
         truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
     };
-    #[cfg(feature = "render")]
-    use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
     use obscura_dom::parse_html;
 
@@ -4983,7 +5004,11 @@ mod tests {
             .unwrap()
             .evaluate("Object.keys(globalThis.__obscura_frameObjects).length")
             .unwrap();
-        assert_eq!(published.as_f64(), Some(1.0), "the page cannot reach the frame");
+        assert_eq!(
+            published.as_f64(),
+            Some(1.0),
+            "the page cannot reach the frame"
+        );
     }
 
     /// The sweep still does its job: an iframe removed from the document has
@@ -5467,11 +5492,8 @@ mod tests {
                 document.head.appendChild(script);
             </script></body></html>"#,
         );
-        let mut page = import_map_test_page(
-            "preload-dynamic-lifecycle",
-            "http://127.0.0.1:9",
-            &html,
-        );
+        let mut page =
+            import_map_test_page("preload-dynamic-lifecycle", "http://127.0.0.1:9", &html);
 
         page.execute_scripts().await;
 
@@ -5591,11 +5613,8 @@ mod tests {
         let started = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(125);
 
-        let completed = super::Page::drive_load_delaying_scripts(
-            page.js.as_mut().unwrap(),
-            deadline,
-        )
-        .await;
+        let completed =
+            super::Page::drive_load_delaying_scripts(page.js.as_mut().unwrap(), deadline).await;
 
         let elapsed = started.elapsed();
         assert!(!completed, "the delayed resource must exceed the deadline");
@@ -5737,9 +5756,7 @@ mod tests {
                     .and_then(|line| line.split_ascii_whitespace().nth(1))
                     .unwrap_or("/");
                 let body = match path {
-                    "/app/lazy.js" => {
-                        "import { ready } from './lazy-child.js'; export { ready };"
-                    }
+                    "/app/lazy.js" => "import { ready } from './lazy-child.js'; export { ready };",
                     "/app/lazy-child.js" => {
                         // Cross the lifecycle's 500ms fast-settle floor on a
                         // descendant edge. deno_core must propagate the lazy
@@ -5808,8 +5825,7 @@ mod tests {
             let _ = accepted_tx.send(());
             let mut request = [0u8; 2048];
             let length = stream.read(&mut request).unwrap();
-            assert!(String::from_utf8_lossy(&request[..length])
-                .starts_with("GET /app/analytics "));
+            assert!(String::from_utf8_lossy(&request[..length]).starts_with("GET /app/analytics "));
             std::thread::sleep(std::time::Duration::from_secs(2));
             let body = "{}";
             let response = format!(
@@ -5828,11 +5844,7 @@ mod tests {
                 }});
             </script></body></html>"#,
         );
-        let mut page = import_map_test_page(
-            "ordinary-fetch-readiness",
-            &base,
-            &html,
-        );
+        let mut page = import_map_test_page("ordinary-fetch-readiness", &base, &html);
         let started = std::time::Instant::now();
         page.execute_scripts().await;
         let elapsed = started.elapsed();
@@ -6127,7 +6139,11 @@ mod tests {
         page.navigate(&page_url).await.unwrap();
 
         let mut paths = (0..3)
-            .map(|_| seen_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap())
+            .map(|_| {
+                seen_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         paths.sort();
         assert_eq!(
@@ -6139,12 +6155,8 @@ mod tests {
             ]
         );
         let js = page.js.as_ref().expect("navigation runtime");
-        assert!(js.render_resource_is_known(&format!(
-            "http://{address}/dynamic.svg"
-        )));
-        assert!(js.render_resource_is_known(&format!(
-            "http://{address}/dynamic.woff2"
-        )));
+        assert!(js.render_resource_is_known(&format!("http://{address}/dynamic.svg")));
+        assert!(js.render_resource_is_known(&format!("http://{address}/dynamic.woff2")));
     }
 
     #[cfg(feature = "render")]
@@ -6305,9 +6317,9 @@ mod tests {
         .expect("materialized graph");
 
         assert!(materialized.starts_with("@media print {\n"));
-        assert!(materialized.contains(
-            r#".print{background:url("https://example.test/css/mark.svg")}"#
-        ));
+        assert!(
+            materialized.contains(r#".print{background:url("https://example.test/css/mark.svg")}"#)
+        );
         assert!(materialized.ends_with(".root{color:red}"));
     }
 
@@ -6657,11 +6669,7 @@ mod tests {
             750
         );
         assert_eq!(
-            remaining_settle_resource_warmup_ms(
-                1_000,
-                std::time::Duration::from_millis(250),
-                100,
-            ),
+            remaining_settle_resource_warmup_ms(1_000, std::time::Duration::from_millis(250), 100,),
             100
         );
         assert_eq!(

@@ -1,8 +1,11 @@
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use obscura_browser::BrowserContext;
+use deno_core::JsRuntime;
+use obscura_browser::{BrowserContext, RuntimeFactory};
+use obscura_js::module_loader::ObscuraModuleLoader;
 use obscura_net::CookieJar;
 
 use crate::config::BrowserConfig;
@@ -15,6 +18,7 @@ static NEXT_PAGE_ID: AtomicU64 = AtomicU64::new(1);
 pub struct Browser {
     context: Arc<BrowserContext>,
     cookie_jar: Arc<CookieJar>,
+    runtime_factory: Option<RuntimeFactory>,
 }
 
 impl Browser {
@@ -43,7 +47,20 @@ impl Browser {
         let context = Arc::new(context);
         let cookie_jar = context.cookie_jar.clone();
 
-        Ok(Browser { context, cookie_jar })
+        Ok(Browser {
+            context,
+            cookie_jar,
+            runtime_factory: None,
+        })
+    }
+
+    pub fn build_with_runtime_factory(
+        config: BrowserConfig,
+        runtime_factory: RuntimeFactory,
+    ) -> Result<Self, Error> {
+        let mut browser = Self::build(config)?;
+        browser.runtime_factory = Some(runtime_factory);
+        Ok(browser)
     }
 
     pub fn builder() -> BrowserBuilder {
@@ -52,9 +69,10 @@ impl Browser {
 
     pub async fn new_page(&self) -> Result<Page, Error> {
         let id = NEXT_PAGE_ID.fetch_add(1, Ordering::Relaxed);
-        let page = obscura_browser::Page::new(
+        let page = obscura_browser::Page::new_with_runtime_factory(
             format!("page-{}", id),
             self.context.clone(),
+            self.runtime_factory.clone(),
         );
         Ok(Page {
             inner: RefCell::new(page),
@@ -70,9 +88,17 @@ impl Browser {
 #[derive(Default)]
 pub struct BrowserBuilder {
     config: BrowserConfig,
+    runtime_factory: Option<RuntimeFactory>,
 }
 
 impl BrowserBuilder {
+    pub fn runtime_factory(
+        mut self,
+        factory: impl Fn(Rc<ObscuraModuleLoader>) -> JsRuntime + 'static,
+    ) -> Self {
+        self.runtime_factory = Some(Arc::new(factory));
+        self
+    }
     pub fn proxy(mut self, proxy: impl Into<String>) -> Self {
         self.config.proxy = Some(proxy.into());
         self
@@ -90,6 +116,9 @@ impl BrowserBuilder {
         self
     }
     pub fn build(self) -> Result<Browser, Error> {
-        Browser::build(self.config)
+        match self.runtime_factory {
+            Some(factory) => Browser::build_with_runtime_factory(self.config, factory),
+            None => Browser::build(self.config),
+        }
     }
 }
